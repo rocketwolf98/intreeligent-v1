@@ -7,3 +7,4 @@ scikit-learn
 matplotlib
 tqdm
 segmentation-models-pytorch
+torchvision

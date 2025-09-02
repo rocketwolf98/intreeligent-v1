@@ -37,7 +37,7 @@ image = (
 )
 
 # Create volume for data
-volume = modal.Volume.from_name("treesdataset")
+volume = modal.Volume.from_name("treesdataset", create_if_missing=True)
 
 # Converting XML annotations to masks
 def xml_to_mask(xml_path, img_shape):

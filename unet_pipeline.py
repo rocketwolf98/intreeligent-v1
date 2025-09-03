@@ -20,15 +20,15 @@ image = (
 )
 
 # Create volume for dataset
-volume = modal.Volume.from_name("tree-dataset", create_if_missing=True)
+volume = modal.Volume.from_name("treesdataset", create_if_missing=True)
 
 @app.function(
     image=image,
     volumes={"/data": volume},
-    gpu="T4",
+    gpu="A100",
     timeout=3600
 )
-def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
+def train_model(epochs=75, batch_size=16, learning_rate=1e-3):
     import pandas as pd
     import numpy as np
     import torch
@@ -107,12 +107,13 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
             return mask
 
     class DoubleConv(nn.Module):
-        def __init__(self, in_channels, out_channels):
+        def __init__(self, in_channels, out_channels, dropout=0.1):
             super(DoubleConv, self).__init__()
             self.conv = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
+                nn.Dropout2d(dropout),
                 nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True)
@@ -122,7 +123,7 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
             return self.conv(x)
 
     class UNet(nn.Module):
-        def __init__(self, in_channels=3, out_channels=2, features=[64, 128, 256, 512]):
+        def __init__(self, in_channels=3, out_channels=2, features=[64, 128, 256, 512, 1024]):
             super(UNet, self).__init__()
             self.ups = nn.ModuleList()
             self.downs = nn.ModuleList()
@@ -167,17 +168,39 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Data transforms
-    transform = transforms.Compose([
+    # Data transforms with augmentation
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(0.5),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     # Create datasets
-    train_dataset = TreeCrownDataset("/data/train", "/data/train/train.csv", transform=transform)
+    full_dataset = TreeCrownDataset("/data/train", "/data/train/train.csv")
+    from sklearn.model_selection import train_test_split
+    train_indices, val_indices = train_test_split(range(len(full_dataset)), test_size=0.2, random_state=42)
     
+    # Create separate datasets with different transforms
+    train_dataset = TreeCrownDataset("/data/train", "/data/train/train.csv", transform=train_transform)
+    val_dataset = TreeCrownDataset("/data/train", "/data/train/train.csv", transform=val_transform)
+    
+    train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
+
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    patience = 10
     
     # Initialize model
     model = UNet(in_channels=3, out_channels=2).to(device)
@@ -185,17 +208,19 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     # Training loop
-    model.train()
     train_losses = []
+    val_losses = []
     
     for epoch in range(epochs):
+        # Training phase
+        model.train()
         epoch_loss = 0.0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
         
-        for batch_idx, (images, masks) in enumerate(progress_bar):
+        for images, masks in progress_bar:
             images, masks = images.to(device), masks.to(device)
             
             # Forward pass
@@ -208,13 +233,47 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
             optimizer.step()
             
             epoch_loss += loss.item()
-            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            progress_bar.set_postfix({"Train Loss": f"{loss.item():.4f}"})
         
-        avg_loss = epoch_loss / len(train_loader)
-        train_losses.append(avg_loss)
-        scheduler.step(avg_loss)
+        avg_train_loss = epoch_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
-        print(f"Epoch {epoch+1}/{epochs}, Average Loss: {avg_loss:.4f}")
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, masks in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False):
+                images, masks = images.to(device), masks.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        # Update scheduler
+        scheduler.step()
+        
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Early stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+            }, "/data/best_model.pth")
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
         
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -222,7 +281,7 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'loss': avg_train_loss,
             }, f"/data/checkpoint_epoch_{epoch+1}.pth")
     
     # Save final model
@@ -230,8 +289,10 @@ def train_model(epochs=50, batch_size=8, learning_rate=1e-4):
     
     return {
         "message": "Training completed successfully",
-        "final_loss": train_losses[-1],
-        "epochs_trained": epochs
+        "final_train_loss": train_losses[-1],
+        "final_val_loss": val_losses[-1],
+        "best_val_loss": best_val_loss,
+        "epochs_trained": len(train_losses)
     }
 
 @app.function(
@@ -319,12 +380,13 @@ def evaluate_model(model_path="/data/tree_segmentation_model.pth"):
             return mask
 
     class DoubleConv(nn.Module):
-        def __init__(self, in_channels, out_channels):
+        def __init__(self, in_channels, out_channels, dropout=0.1):
             super(DoubleConv, self).__init__()
             self.conv = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
+                nn.Dropout2d(dropout),
                 nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True)
@@ -334,7 +396,7 @@ def evaluate_model(model_path="/data/tree_segmentation_model.pth"):
             return self.conv(x)
 
     class UNet(nn.Module):
-        def __init__(self, in_channels=3, out_channels=2, features=[64, 128, 256, 512]):
+        def __init__(self, in_channels=3, out_channels=2, features=[64, 128, 256, 512, 1024]):
             super(UNet, self).__init__()
             self.ups = nn.ModuleList()
             self.downs = nn.ModuleList()
@@ -416,6 +478,41 @@ def evaluate_model(model_path="/data/tree_segmentation_model.pth"):
     }
 
 @app.function(image=image, volumes={"/data": volume})
+def download_model(model_name="tree_segmentation_model.pth", local_path="./"):
+    """Download trained model from Modal volume to local filesystem"""
+    import shutil
+    import os
+    from pathlib import Path
+    
+    # Available models in the volume
+    model_files = [
+        "tree_segmentation_model.pth",  # Final model
+        "best_model.pth",              # Best validation model
+    ]
+    
+    # Add checkpoint files if they exist
+    checkpoint_files = []
+    for i in range(10, 80, 10):  # Check for checkpoints every 10 epochs
+        checkpoint_file = f"checkpoint_epoch_{i}.pth"
+        if os.path.exists(f"/data/{checkpoint_file}"):
+            checkpoint_files.append(checkpoint_file)
+    
+    print(f"Available models: {model_files + checkpoint_files}")
+    
+    # Download specified model
+    remote_path = f"/data/{model_name}"
+    local_file_path = Path(local_path) / model_name
+    
+    if os.path.exists(remote_path):
+        shutil.copy(remote_path, local_file_path)
+        print(f"✓ Downloaded {model_name} to {local_file_path}")
+        print(f"Model size: {os.path.getsize(local_file_path) / 1024 / 1024:.2f} MB")
+        return f"Model downloaded successfully to {local_file_path}"
+    else:
+        print(f"❌ Model {model_name} not found in volume")
+        return f"Model {model_name} not found"
+
+@app.function(image=image, volumes={"/data": volume})
 def upload_dataset():
     """Upload local dataset to Modal volume"""
     import shutil
@@ -445,7 +542,7 @@ def main():
     
     # Step 2: Train model
     print("\n2. Training model...")
-    train_result = train_model.remote(epochs=30, batch_size=8, learning_rate=1e-4)
+    train_result = train_model.remote(epochs=75, batch_size=16, learning_rate=1e-3)
     print(train_result)
     
     # Step 3: Evaluate model
@@ -455,6 +552,17 @@ def main():
     print(f"  Accuracy: {eval_result['accuracy']:.4f}")
     print(f"  IoU: {eval_result['iou']:.4f}")
     print(f"  Test samples: {eval_result['num_samples']}")
+    
+    # Step 4: Download models
+    print("\n4. Downloading trained models...")
+    
+    # Download best model (recommended)
+    best_model_result = download_model.remote(model_name="best_model.pth", local_path="./models/")
+    print(best_model_result)
+    
+    # Download final model
+    final_model_result = download_model.remote(model_name="tree_segmentation_model.pth", local_path="./models/")
+    print(final_model_result)
     
     print("\n🎉 Pipeline completed successfully!")
 

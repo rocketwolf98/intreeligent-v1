@@ -308,10 +308,13 @@ def main():
                         }
                     
                     # Initialize autoencoder (you'll need to import your model class)
-                    # autoencoder_model = YourAutoencoderClass(...)
+                    autoencoder_model = TreeCrownResNet34(
+                        freeze_backbone=True,
+                        latent_dim=256  # Must match your trained model
+                    )
                     
                     # Run pipeline
-                    # results_json, fig = run_pipeline(config, autoencoder_model, param_grid)
+                    results_json, fig = run_pipeline(config, autoencoder_model, param_grid)
                     
                     # For now, show placeholder
                     st.error("⚠️ Please import and initialize your autoencoder model class")

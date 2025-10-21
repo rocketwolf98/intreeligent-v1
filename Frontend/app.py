@@ -14,12 +14,15 @@ import tempfile
 import shutil
 from typing import Optional, Dict, List, Tuple
 
+import os
+os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
+
 import tree_crown_pipeline
 import orthomosaic_pipeline
 
 # Page configuration
 st.set_page_config(
-    page_title="Tree Crown Analysis",
+    page_title="Intreeligent Prototype v1",
     page_icon="🌳",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -109,7 +112,7 @@ def create_tile_thumbnail(tile_rgb, detections, cluster_info, size=256):
 
 def main():
     # Header
-    st.markdown('<div class="main-header">🌳 Tree Crown Segmentation & Clustering</div>', 
+    st.markdown('<div class="main-header">🌳 Intreeligent Prototype v1</div>', 
                 unsafe_allow_html=True)
     
     # Sidebar - Configuration

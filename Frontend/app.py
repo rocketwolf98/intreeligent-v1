@@ -14,9 +14,6 @@ import tempfile
 import shutil
 from typing import Optional, Dict, List, Tuple
 
-import os
-os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
-
 import tree_crown_pipeline
 import orthomosaic_pipeline
 

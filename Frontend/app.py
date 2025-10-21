@@ -16,6 +16,7 @@ from typing import Optional, Dict, List, Tuple
 
 import tree_crown_pipeline
 import orthomosaic_pipeline
+from autoencoders import TreeCrownResNet34
 
 # Page configuration
 st.set_page_config(
@@ -312,13 +313,20 @@ def main():
                         freeze_backbone=True,
                         latent_dim=256  # Must match your trained model
                     )
+
+                    # Load weights
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    autoencoder_model.load_state_dict(
+                        torch.load(autoencoder_path, map_location=device)
+                    )
+                    autoencoder_model.to(device)
+                    autoencoder_model.eval()
                     
                     # Run pipeline
                     results_json, fig = run_pipeline(config, autoencoder_model, param_grid)
                     
                     # For now, show placeholder
-                    st.error("⚠️ Please import and initialize your autoencoder model class")
-                    return
+                    # st.error("⚠️ Please import and initialize your autoencoder model class")
                 
                 else:  # Orthomosaic
                     from orthomosaic_pipeline import OrthomosaicConfig, run_orthomosaic_pipeline
@@ -349,15 +357,17 @@ def main():
                         }
                     
                     # Run pipeline
-                    # results_json, fig = run_orthomosaic_pipeline(config, autoencoder_model, param_grid)
+                    results_json, fig = run_orthomosaic_pipeline(config, autoencoder_model, param_grid)
                     
-                    st.error("⚠️ Please import and initialize your autoencoder model class")
-                    return
+                    #st.error("⚠️ Please import and initialize your autoencoder model class")
                 
                 # Store results
                 st.session_state.results = results_json
                 st.session_state.config = config
+                st.session_state.fig = fig  # ADD THIS LINE
                 st.session_state.processing_complete = True
+                st.session_state.output_dir = str(temp_dir / "outputs")  # ADD THIS LINE
+
                 
                 st.success("✅ Processing complete!")
                 st.rerun()
@@ -368,13 +378,18 @@ def main():
     
     # Display results
     if st.session_state.processing_complete and st.session_state.results:
-        display_results(st.session_state.results, st.session_state.config)
+        display_results(
+            st.session_state.results, 
+            st.session_state.config,
+            st.session_state.fig,
+            st.session_state.output_dir
+        )
 
 # ============================================================================
 # Results Display
 # ============================================================================
 
-def display_results(results: Dict, config):
+def display_results(results: Dict, config, fig, output_dir:str):
     """Display analysis results with interactive visualizations"""
     
     st.success("✅ Analysis Complete!")
@@ -400,7 +415,89 @@ def display_results(results: Dict, config):
         st.metric("Silhouette Score", f"{metadata['silhouette_score']:.3f}")
     
     st.divider()
+
+    st.header("🖼️ Visualizations")
+
+    is_single_image = 'tile_id' not in pd.DataFrame(results['annotations']).columns
     
+    if is_single_image:
+        # Single Image Mode - Show main overlay and clustering visualization
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Clustered Detections")
+
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
+
+            overlay_path = Path(output_dir) / "visualization_overlay.png"
+            if overlay_path.exists():
+                overlay_img = Image.open(overlay_path)
+
+                from io import BytesIO
+                buf = BytesIO()
+                overlay_img.save(buf, format='PNG')
+                buf.seek(0)
+
+                st. download_button(
+                    label="📥 Download Overlay Image",
+                    data=buf,
+                    file_name="tree_crown_overlay.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
+            with col2:
+                st.subheader("Clustering Visualization")
+        
+                # If your pipeline generates additional plots, display them here
+                clustering_plot_path = Path(output_dir) / "clustering_visualization.png"
+                if clustering_plot_path.exists():
+                    st.image(str(clustering_plot_path), use_column_width=True)
+            
+                    # Download button
+                    with open(clustering_plot_path, 'rb') as f:
+                        st.download_button(
+                            label="📥 Download Clustering Plot",
+                            data=f,
+                            file_name="clustering_visualization.png",
+                            mime="image/png",
+                            use_container_width=True
+                        )
+                else:
+                    st.info("Clustering visualization will appear here")
+
+    else:
+        # Orthomosaic Mode - Show tile gallery preview
+        st.subheader("📍 Tile Overview")
+    
+        # Display main figure if available
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+        
+            # Try to save and offer download
+            try:
+                from io import BytesIO
+                buf = BytesIO()
+                fig.write_image(buf, format='png', width=1920, height=1080)
+                buf.seek(0)
+            
+                st.download_button(
+                    label="📥 Download Overview Visualization",
+                    data=buf,
+                    file_name="orthomosaic_overview.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
+            except:
+                st.info("Install kaleido for image export: pip install kaleido")
+    
+        # Quick stats
+        df = pd.DataFrame(results['annotations'])
+        st.info(f"📊 Processed {df['tile_id'].nunique()} tiles with {len(df)} total detections")
+
+    st.divider()
+            
+
     # Tabs for different views
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Cluster Analysis",
@@ -550,7 +647,41 @@ def display_results(results: Dict, config):
     # Tab 4: Export
     with tab4:
         st.subheader("Export Results")
-        
+    
+        # Add visualization downloads section
+        st.markdown("### 🖼️ Visualizations")
+    
+        col1, col2 = st.columns(2)
+    
+        with col1:
+            # Main overlay/visualization
+            overlay_path = Path(output_dir) / "visualization_overlay.png"
+            if overlay_path.exists():
+                with open(overlay_path, 'rb') as f:
+                    st.download_button(
+                        label="📥 Download Main Visualization",
+                        data=f,
+                        file_name="tree_crown_visualization.png",
+                        mime="image/png",
+                        use_container_width=True
+                    )
+    
+        with col2:
+            # Clustering plot
+            clustering_plot = Path(output_dir) / "clustering_visualization.png"
+            if clustering_plot.exists():
+                with open(clustering_plot, 'rb') as f:
+                    st.download_button(
+                        label="📥 Download Clustering Plot",
+                        data=f,
+                        file_name="clustering_plot.png",
+                        mime="image/png",
+                        use_container_width=True
+                    )
+    
+        st.divider()
+        st.markdown("### 📊 Data Files")
+            
         col1, col2 = st.columns(2)
         
         with col1:
